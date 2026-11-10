@@ -1,0 +1,84 @@
+name: Build personal APK
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  android:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CI: "true"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          key: personal-android
+      - name: Prepare Android SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          SDKM="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --licenses >/dev/null 2>&1 || true
+          "$SDKM" --install "platform-tools" "platforms;android-36" "build-tools;36.0.0" "ndk;28.2.13676358"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          echo "NDK_HOME=$SDK/ndk/28.2.13676358" >> "$GITHUB_ENV"
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm tauri android init --ci
+      - name: Build ARM64 and ARMv7 APK
+        run: pnpm tauri android build --apk --target aarch64 armv7 --ci
+      - name: Sign and verify personal APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          BT="$ANDROID_SDK_ROOT/build-tools/36.0.0"
+          KS="$RUNNER_TEMP/personal.jks"
+          # Temporary personal test key; later builds may require uninstalling first.
+          export PERSONAL_APK_PASSWORD
+          PERSONAL_APK_PASSWORD="$(openssl rand -hex 24)"
+          echo "::add-mask::$PERSONAL_APK_PASSWORD"
+          trap 'rm -f "$KS"' EXIT
+          keytool -genkeypair -noprompt -keystore "$KS" -alias personal \
+            -storepass:env PERSONAL_APK_PASSWORD -keypass:env PERSONAL_APK_PASSWORD \
+            -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=HGhub Personal Build"
+          mkdir -p artifacts
+          VERSION="$(node -p "require('./package.json').version")"
+          mapfile -t APKS < <(find src-tauri/gen/android/app/build/outputs/apk -type f -name '*release*.apk')
+          if [ "${#APKS[@]}" -ne 1 ]; then
+            printf 'Expected one universal APK; found %s\n' "${#APKS[@]}" >&2
+            exit 1
+          fi
+          OUT="artifacts/HGhub_${VERSION}_arm_personal.apk"
+          "$BT/zipalign" -f -p 4 "${APKS[0]}" "$RUNNER_TEMP/aligned.apk"
+          "$BT/apksigner" sign --ks "$KS" --ks-key-alias personal \
+            --ks-pass env:PERSONAL_APK_PASSWORD --key-pass env:PERSONAL_APK_PASSWORD \
+            --v4-signing-enabled false --out "$OUT" "$RUNNER_TEMP/aligned.apk"
+          "$BT/apksigner" verify --verbose --print-certs "$OUT"
+          "$BT/aapt" dump badging "$OUT" > "$RUNNER_TEMP/apk-info.txt"
+          head -5 "$RUNNER_TEMP/apk-info.txt"
+          (cd artifacts && sha256sum *.apk > SHA256SUMS.txt)
+          echo 'Personal APK signed and verified. Supports ARM64/ARMv7, Android 7.0+.' >> "$GITHUB_STEP_SUMMARY"
+          echo 'This run uses a temporary signing key. A later build may require uninstalling the previous app.' >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: HGhub-personal-APK
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 14
